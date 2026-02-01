@@ -396,6 +396,9 @@ void run_scenario_7() {
 void run_scenario_8() {
     ESP_LOGI(TAG, "SCENARIO 8 START");
 
+    // Mở khóa để điều khiển chân SET lên mức 1
+    gpio_hold_dis(PIN_PMS_SET);
+
     // 1. Warmup (30s)
     gpio_set_level(PIN_PMS_SET, 1);
     
@@ -446,6 +449,7 @@ void run_scenario_8() {
     vTaskDelay(pdMS_TO_TICKS(1000));
 
     u8g2_SetPowerSave(&u8g2, 1); gpio_set_level(PIN_PMS_SET, 0);
+    // Giữ chân SET ở mức 0 trong lúc ngủ
     gpio_hold_en(PIN_PMS_SET); gpio_deep_sleep_hold_en();
     esp_sleep_enable_timer_wakeup(SLEEP_DURATION_MINS * 60 * 1000000ULL);
     
@@ -460,6 +464,9 @@ void run_scenario_8() {
 // ============================================================
 void run_scenario_9() {
     ESP_LOGI(TAG, "SCENARIO 9 START");
+
+    // Mở khóa để điều khiển chân SET lên mức 1
+    gpio_hold_dis(PIN_PMS_SET);
 
     // 1. Warmup (30s)
     gpio_set_level(PIN_PMS_SET, 1);
@@ -526,6 +533,7 @@ void run_scenario_9() {
     vTaskDelay(pdMS_TO_TICKS(1000));
 
     u8g2_SetPowerSave(&u8g2, 1); gpio_set_level(PIN_PMS_SET, 0);
+    // Giữ chân SET ở mức 0 trong lúc ngủ
     gpio_hold_en(PIN_PMS_SET); gpio_deep_sleep_hold_en();
     
     esp_sleep_enable_timer_wakeup(next_sleep_mins * 60 * 1000000ULL);
