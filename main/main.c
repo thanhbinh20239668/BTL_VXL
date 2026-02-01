@@ -26,6 +26,10 @@
 - SD Card: Sau khi ghi giá trị đo được thì sleep
 - BME280: Forced mode
 - DS3231: Hoạt động liên tục
+* Kịch bản 9: Tự động điều chỉnh thời gian ngủ (Logic mờ)
+- AQI <= 100: Ngủ 30p (không khí tạm ổn so với nền chung)
+- 100 < AQI <= 200: Ngủ 15p (mức phổ biến, đo bình thường)
+- AQI > 200: Ngủ 5p (ô nhiễm nguy hại, cần được theo dõi sát)
 ============================================================================================================================
 */
 
@@ -58,7 +62,7 @@
 // ============================================================
 // CẤU HÌNH NGƯỜI DÙNG
 // ============================================================
-#define CURRENT_SCENARIO    8   // Chọn kịch bản (1 -> 8)
+#define CURRENT_SCENARIO    9   // Chọn kịch bản (1 -> 9)
 
 // Cài đặt thời gian (1 để chỉnh sau đó chuyển về 0)
 #define SET_RTC_TIME_NOW    0   
@@ -70,9 +74,14 @@
 #define TIME_MIN            34   
 #define TIME_SEC            0   
 
-// Cấu hình
+// Cấu hình thời gian
 #define SLEEP_DURATION_MINS 15  
-#define WARMUP_SECONDS      30  
+#define WARMUP_SECONDS      30
+
+// Cấu hình cho kịch bản 9
+#define SLEEP_FAST_MINS     5   // Đo 5 phút/lần
+#define SLEEP_NORMAL_MINS   15  // Đo 15 phút/lần
+#define SLEEP_SLOW_MINS     30  // Đo 30 phút/lần
 
 // Cấu hình chân
 #define PIN_PMS_SET         GPIO_NUM_33
@@ -105,6 +114,43 @@ typedef struct {
 } pms_data_t;
 
 pms_data_t pms_last_reading = {0, 0, 0, false};
+
+// ============================================================
+// TÍNH TOÁN AQI (CHUẨN VIỆT NAM)
+// ============================================================
+int calc_aqi_linear(int C_high, int C_low, int I_high, int I_low, int C) {
+    if (C_high - C_low == 0) return I_low;
+    return ((I_high - I_low) * (C - C_low) / (C_high - C_low)) + I_low;
+}
+
+/* 
+ * BẢNG TRA CỨU PM2.5 (ug/m3) THEO QĐ-1459/TCMT (Việt Nam):
+ * 0 - 25    => AQI 0 - 50    (Tốt)
+ * 26 - 50   => AQI 51 - 100  (Trung bình)
+ * 51 - 80   => AQI 101 - 150 (Kém)
+ * 81 - 150  => AQI 151 - 200 (Xấu)
+ * 151 - 350 => AQI 201 - 300 (Rất xấu)
+ * > 350     => AQI 301 - 500 (Nguy hại)
+ */
+int calculate_aqi(int pm25) {
+    if (pm25 < 0) return 0;
+    if (pm25 <= 25) return calc_aqi_linear(25, 0, 50, 0, pm25);
+    else if (pm25 <= 50) return calc_aqi_linear(50, 26, 100, 51, pm25);
+    else if (pm25 <= 80) return calc_aqi_linear(80, 51, 150, 101, pm25);
+    else if (pm25 <= 150) return calc_aqi_linear(150, 81, 200, 151, pm25);
+    else if (pm25 <= 350) return calc_aqi_linear(350, 151, 300, 201, pm25);
+    else if (pm25 <= 500) return calc_aqi_linear(500, 351, 500, 301, pm25);
+    else return 500;
+}
+
+void get_aqi_label(int aqi, char* label) {
+    if (aqi <= 50) strcpy(label, "Good");
+    else if (aqi <= 100) strcpy(label, "Moderate");
+    else if (aqi <= 150) strcpy(label, "Poor"); 
+    else if (aqi <= 200) strcpy(label, "Bad");
+    else if (aqi <= 300) strcpy(label, "Very Bad");
+    else strcpy(label, "Hazardous");
+}
 
 // ============================================================
 // KHỞI TẠO PHẦN CỨNG
@@ -194,20 +240,20 @@ void check_and_write_header() {
     if (stat(FILE_PATH, &st) != 0) {
         FILE *f = fopen(FILE_PATH, "w");
         if (f) {
-            fprintf(f, "Time,PM1.0,PM2.5,PM10,Temp,Hum,Pres\n");
+            fprintf(f, "Time,PM1.0,PM2.5,PM10,AQI,Temp,Hum,Pres\n");
             fclose(f);
         }
     }
 }
 
-void save_data_csv(struct tm t, bme280_data_t bme, pms_data_t pms) {
+void save_data_csv(struct tm t, bme280_data_t bme, pms_data_t pms, int aqi) {
     if (!is_sd_mounted) return;
     FILE *f = fopen(FILE_PATH, "a");
     if (f) {
-        fprintf(f, "%02d-%02d-%04d %02d:%02d:%02d,%d,%d,%d,%.1f,%.1f,%.1f\n",
+        fprintf(f, "%02d-%02d-%04d %02d:%02d:%02d,%d,%d,%d,%d,%.1f,%.1f,%.1f\n",
                 t.tm_mday, t.tm_mon + 1, t.tm_year + 1900,
                 t.tm_hour, t.tm_min, t.tm_sec,
-                pms.pm1_0, pms.pm2_5, pms.pm10,
+                pms.pm1_0, pms.pm2_5, pms.pm10, aqi,
                 bme.temperature, bme.humidity, bme.pressure
         );
         fclose(f);
@@ -217,8 +263,10 @@ void save_data_csv(struct tm t, bme280_data_t bme, pms_data_t pms) {
 // ============================================================
 // HIỂN THỊ LÊN MÀN HÌNH OLED
 // ============================================================
-void ui_draw_dashboard(struct tm t, float temp, float hum, float pres, int pm25, const char* status) {
+void ui_draw_dashboard(struct tm t, float temp, float hum, float pres, int pm25, int aqi, const char* status) {
     char buf[32];
+    char aqi_status[16];
+    get_aqi_label(aqi, aqi_status);
     u8g2_ClearBuffer(&u8g2);
 
     // Thời gian
@@ -230,10 +278,20 @@ void ui_draw_dashboard(struct tm t, float temp, float hum, float pres, int pm25,
     u8g2_DrawStr(&u8g2, 128 - w, 10, buf); 
     u8g2_DrawLine(&u8g2, 0, 12, 127, 12);
 
+    // AQI
+    u8g2_SetFont(&u8g2, u8g2_font_profont11_tf); 
+    sprintf(buf, "AQI: %d", aqi);
+    u8g2_DrawStr(&u8g2, 0, 25, buf); 
+
+    // Đánh giá chất lượng (Good/Bad...)
+    u8g2_SetFont(&u8g2, u8g2_font_helvB10_tr);
+    int w_st = u8g2_GetStrWidth(&u8g2, aqi_status);
+    u8g2_DrawStr(&u8g2, 128 - w_st, 30, aqi_status);
+
     // PM2.5
-    u8g2_SetFont(&u8g2, u8g2_font_helvB14_tr); 
+    u8g2_SetFont(&u8g2, u8g2_font_profont11_tf); 
     sprintf(buf, "PM2.5: %d", pm25);
-    u8g2_DrawStr(&u8g2, 0, 32, buf); 
+    u8g2_DrawStr(&u8g2, 0, 35, buf); 
 
     // Temp, Hum, Pres
     u8g2_SetFont(&u8g2, u8g2_font_profont11_tf);
@@ -275,12 +333,15 @@ void run_active_scenarios(int scenario) {
         pms_data_t current_pms = pms_read_data();
         if (current_pms.valid) pms_last_reading = current_pms; // Lưu giá trị tốt nhất
 
+        // Tính AQI
+        int current_aqi = calculate_aqi(pms_last_reading.pm2_5);
+
         if(use_oled) {
             char st[32]; sprintf(st, "Run S%d...", scenario);
-            ui_draw_dashboard(rtc_time, bme_data.temperature, bme_data.humidity, bme_data.pressure, pms_last_reading.pm2_5, st);
+            ui_draw_dashboard(rtc_time, bme_data.temperature, bme_data.humidity, bme_data.pressure, pms_last_reading.pm2_5, current_aqi, st);
         }
         if(use_sd && is_sd_mounted) {
-            save_data_csv(rtc_time, bme_data, pms_last_reading);
+            save_data_csv(rtc_time, bme_data, pms_last_reading, current_aqi);
         }
         if(use_wifi) {
             wifi_scan_config_t sc = {.show_hidden=true}; esp_wifi_scan_start(&sc, false);
@@ -309,13 +370,18 @@ void run_scenario_7() {
             pms_data_t current_pms = pms_read_data();
             if (current_pms.valid) pms_last_reading = current_pms;
 
+            // Tính AQI trong lúc warmup
+            int temp_aqi = calculate_aqi(pms_last_reading.pm2_5);
+
             char s[32]; sprintf(s, "Awake: %ds", i);
-            ui_draw_dashboard(rtc_time, bme_data.temperature, bme_data.humidity, bme_data.pressure, pms_last_reading.pm2_5, s);
+            ui_draw_dashboard(rtc_time, bme_data.temperature, bme_data.humidity, bme_data.pressure, pms_last_reading.pm2_5, temp_aqi, s);
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
 
+        // Tính AQI lần cuối trước khi ngủ
+        int final_aqi = calculate_aqi(pms_last_reading.pm2_5);
         char m[32]; sprintf(m, "Light Sleep %dm", SLEEP_DURATION_MINS);
-        ui_draw_dashboard(rtc_time, bme_data.temperature, bme_data.humidity, bme_data.pressure, pms_last_reading.pm2_5, m);
+        ui_draw_dashboard(rtc_time, bme_data.temperature, bme_data.humidity, bme_data.pressure, pms_last_reading.pm2_5, final_aqi, m);
         vTaskDelay(pdMS_TO_TICKS(2000));
         
         u8g2_SetPowerSave(&u8g2, 1); gpio_set_level(PIN_PMS_SET, 0);
@@ -344,8 +410,11 @@ void run_scenario_8() {
         pms_data_t current_pms = pms_read_data();
         if (current_pms.valid) pms_last_reading = current_pms;
 
+        // Tính AQI tạm thời để hiển thị
+        int temp_aqi = calculate_aqi(pms_last_reading.pm2_5);
+
         char status[32]; sprintf(status, "Warmup: %ds", i);
-        ui_draw_dashboard(rtc_time, bme_data.temperature, bme_data.humidity, bme_data.pressure, pms_last_reading.pm2_5, status);
+        ui_draw_dashboard(rtc_time, bme_data.temperature, bme_data.humidity, bme_data.pressure, pms_last_reading.pm2_5, temp_aqi, status);
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
@@ -356,27 +425,110 @@ void run_scenario_8() {
     pms_data_t final_pms = pms_read_data();
     // Nếu đọc lỗi, dùng giá trị gần nhất
     if (!final_pms.valid) final_pms = pms_last_reading;
+    // Tính AQI lần cuối
+    int final_aqi = calculate_aqi(final_pms.pm2_5);
 
     char log_status[32] = "Saving...";
     if (is_sd_mounted) {
         check_and_write_header();
-        save_data_csv(rtc_time, bme_data, final_pms);
+        save_data_csv(rtc_time, bme_data, final_pms, final_aqi);
         strcpy(log_status, "Saved OK");
     } else {
         strcpy(log_status, "No SD");
     }
 
-    ui_draw_dashboard(rtc_time, bme_data.temperature, bme_data.humidity, bme_data.pressure, final_pms.pm2_5, log_status);
+    ui_draw_dashboard(rtc_time, bme_data.temperature, bme_data.humidity, bme_data.pressure, final_pms.pm2_5, final_aqi, log_status);
     vTaskDelay(pdMS_TO_TICKS(2000));
 
     // 3. Chuẩn bị Deep sleep
     char m[32]; sprintf(m, "Deep Sleep %dm", SLEEP_DURATION_MINS);
-    ui_draw_dashboard(rtc_time, bme_data.temperature, bme_data.humidity, bme_data.pressure, final_pms.pm2_5, m);
+    ui_draw_dashboard(rtc_time, bme_data.temperature, bme_data.humidity, bme_data.pressure, final_pms.pm2_5, final_aqi, m);
     vTaskDelay(pdMS_TO_TICKS(1000));
 
     u8g2_SetPowerSave(&u8g2, 1); gpio_set_level(PIN_PMS_SET, 0);
     gpio_hold_en(PIN_PMS_SET); gpio_deep_sleep_hold_en();
     esp_sleep_enable_timer_wakeup(SLEEP_DURATION_MINS * 60 * 1000000ULL);
+    
+    fflush(stdout); 
+    vTaskDelay(pdMS_TO_TICKS(100)); 
+
+    esp_deep_sleep_start();
+}
+
+// ============================================================
+// KỊCH BẢN 9: SMART DEEP SLEEP (Ngủ thích ứng)
+// ============================================================
+void run_scenario_9() {
+    ESP_LOGI(TAG, "SCENARIO 9 START");
+
+    // 1. Warmup (30s)
+    gpio_set_level(PIN_PMS_SET, 1);
+    uart_flush_input(PORT_PMS_UART);
+
+    for(int i = WARMUP_SECONDS; i > 0; i--) {
+        ds3231_get_time(PORT_APP_I2C, &rtc_time);
+        bme280_read_data(PORT_APP_I2C, &bme_data);
+        
+        pms_data_t current_pms = pms_read_data();
+        if (current_pms.valid) pms_last_reading = current_pms;
+        
+        int temp_aqi = calculate_aqi(pms_last_reading.pm2_5);
+
+        char status[32]; sprintf(status, "Warmup: %ds", i);
+        ui_draw_dashboard(rtc_time, bme_data.temperature, bme_data.humidity, bme_data.pressure, pms_last_reading.pm2_5, temp_aqi, status);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    // 2. Chốt số liệu
+    bme280_read_data(PORT_APP_I2C, &bme_data);
+    pms_data_t final_pms = pms_read_data();
+    if (!final_pms.valid) final_pms = pms_last_reading;
+
+    int final_aqi = calculate_aqi(final_pms.pm2_5);
+
+    // --------------------------------------------------------
+    // THUẬT TOÁN TỰ CHỈNH THỜI GIAN NGỦ
+    // --------------------------------------------------------
+    int next_sleep_mins = SLEEP_NORMAL_MINS; // Mặc định 15p
+
+    // Ngưỡng 1: AQI <= 100 (Chấp nhận được tại HN) -> Ngủ 30p
+    if (final_aqi <= 100) {
+        next_sleep_mins = SLEEP_SLOW_MINS; 
+        ESP_LOGI(TAG, "Air Quality OK (AQI=%d) -> Sleep LONG (%dm)", final_aqi, next_sleep_mins);
+    } 
+    // Ngưỡng 2: AQI > 200 (Thực sự nguy hại) -> Ngủ 5p
+    else if (final_aqi > 200) {
+        next_sleep_mins = SLEEP_FAST_MINS; 
+        ESP_LOGI(TAG, "Air Quality Hazardous (AQI=%d) -> Sleep FAST (%dm)", final_aqi, next_sleep_mins);
+    } 
+    // Ngưỡng giữa: 100 < AQI <= 200 (Mức phổ biến) -> Ngủ 15p
+    else {
+        next_sleep_mins = SLEEP_NORMAL_MINS; 
+        ESP_LOGI(TAG, "Air Quality Common (AQI=%d) -> Sleep NORMAL (%dm)", final_aqi, next_sleep_mins);
+    }
+
+    char log_status[32] = "Saving...";
+    if (is_sd_mounted) {
+        check_and_write_header();
+        save_data_csv(rtc_time, bme_data, final_pms, final_aqi);
+        strcpy(log_status, "Saved OK");
+    } else {
+        strcpy(log_status, "No SD");
+    }
+
+    ui_draw_dashboard(rtc_time, bme_data.temperature, bme_data.humidity, bme_data.pressure, final_pms.pm2_5, final_aqi, log_status);
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    // 3. Chuẩn bị Deep sleep
+    char m[32]; 
+    sprintf(m, "Smart Sleep %dm", next_sleep_mins);
+    ui_draw_dashboard(rtc_time, bme_data.temperature, bme_data.humidity, bme_data.pressure, final_pms.pm2_5, final_aqi, m);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    u8g2_SetPowerSave(&u8g2, 1); gpio_set_level(PIN_PMS_SET, 0);
+    gpio_hold_en(PIN_PMS_SET); gpio_deep_sleep_hold_en();
+    
+    esp_sleep_enable_timer_wakeup(next_sleep_mins * 60 * 1000000ULL);
     
     fflush(stdout); 
     vTaskDelay(pdMS_TO_TICKS(100)); 
@@ -407,4 +559,5 @@ void app_main(void) {
     if (CURRENT_SCENARIO <= 6) run_active_scenarios(CURRENT_SCENARIO);
     else if (CURRENT_SCENARIO == 7) run_scenario_7();
     else if (CURRENT_SCENARIO == 8) run_scenario_8();
+    else if (CURRENT_SCENARIO == 9) run_scenario_9();
 }
